@@ -5,6 +5,23 @@
 #import <GameController/GameController.h>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
+// Use native gamepad input by default. Keep the previous keyboard path available.
+// The client must emit joystick MotionEvents with AINPUT_SOURCE_JOYSTICK.
+static const char* nativeProbeMode = [] {
+    const char* mode = std::getenv("MCPELAUNCHER_JOYCON_MODE");
+    if (!mode) mode = std::getenv("MCPELAUNCHER_JOYCON_PROBE");
+    return mode ? mode : "full";
+}();
+static bool nativeProbeEnabled() {
+    return nativeProbeMode && (!strcmp(nativeProbeMode, "connect") || !strcmp(nativeProbeMode, "neutral") ||
+        !strcmp(nativeProbeMode, "buttons") || !strcmp(nativeProbeMode, "left") ||
+        !strcmp(nativeProbeMode, "right") || !strcmp(nativeProbeMode, "full"));
+}
+static int nativeProbeId = -1;
+static bool nativeProbeMotionLogged = false;
+static bool nativeProbeButtons[15]{};
 static bool nativeJoyLogged = false;
 static bool nativeKeys[18]{};
 static double nativeMouseRemainderX = 0, nativeMouseRemainderY = 0;
@@ -26,6 +43,13 @@ std::unordered_map<int, GLFWJoystickManager::JoystickInfo> GLFWJoystickManager::
 std::unordered_set<int> GLFWJoystickManager::userIds;
 
 void GLFWJoystickManager::init() {
+
+#ifdef __APPLE__
+    if (nativeProbeEnabled()) {
+        fprintf(stderr, "[JoyConProbe] mode=%s; GLFW gamepads disabled\n", nativeProbeMode);
+        return;
+    }
+#endif
     glfwSetJoystickCallback(_glfwJoystickCallback);
     loadMappingsFromFile("gamecontrollerdb.txt");
 }
@@ -106,6 +130,10 @@ void GLFWJoystickManager::addWindow(GLFWGameWindow* window) {
 void GLFWJoystickManager::removeWindow(GLFWGameWindow* window) {
 #ifdef __APPLE__
     if(nativeJoyWindow == window) {
+        if (nativeProbeId >= 0) {
+            userIds.erase(nativeProbeId);
+            nativeProbeId = -1;
+        }
         nativeJoyWindow = nullptr;
         memset(nativeKeys, 0, sizeof(nativeKeys));
         memset(nativeMouse, 0, sizeof(nativeMouse));
@@ -123,6 +151,9 @@ void GLFWJoystickManager::onWindowFocused(GLFWGameWindow* window, bool focused) 
 }
 
 void GLFWJoystickManager::_glfwJoystickCallback(int joystick, int action) {
+#ifdef __APPLE__
+    if (nativeProbeEnabled()) return;
+#endif
     auto js = connectedJoysticks.find(joystick);
     int userId;
     if (action == GLFW_CONNECTED) {
@@ -200,10 +231,83 @@ GamepadAxisId GLFWJoystickManager::mapAxisId(int id) {
     }
 }
 #ifdef __APPLE__
-// Read native Joy-Con state, then use the existing keyboard/mouse callbacks.
-// Do not register an Android gamepad: that path crashes on world load here.
+// Read native Joy-Con state. The default gamepad path requires the client
+// joystick-source fix; explicit keyboard mode preserves the previous fallback.
 void GLFWJoystickManager::updateNativeJoyCon(GLFWGameWindow* window) {
     @autoreleasepool {
+        if (nativeProbeEnabled()) {
+            // No focus-driven connect/disconnect churn; focus only gates motion.
+            GCController* controller = nil;
+            for (GCController* candidate in GCController.controllers) {
+                if ([candidate.productCategory containsString:@"Joy-Con (L/R)"] && candidate.extendedGamepad) {
+                    controller = candidate;
+                    break;
+                }
+            }
+            if (nativeJoyWindow && nativeJoyWindow != window) return;
+            const char* gate = std::getenv("MCPELAUNCHER_JOYCON_PROBE_GATE");
+            const bool enabled = !gate || access(gate, F_OK) == 0;
+            if ((!controller || !enabled) && nativeProbeId >= 0) {
+                fprintf(stderr, "[JoyConProbe] disconnect begin id=%d\n", nativeProbeId);
+                window->onGamepadState(nativeProbeId, false);
+                fprintf(stderr, "[JoyConProbe] disconnect returned\n");
+                userIds.erase(nativeProbeId);
+                nativeProbeId = -1;
+                nativeJoyWindow = nullptr;
+                nativeProbeMotionLogged = false;
+                memset(nativeProbeButtons, 0, sizeof(nativeProbeButtons));
+            }
+            if (!controller || !enabled) return;
+            if (nativeProbeId < 0) {
+                nativeProbeId = nextUnassignedUserId();
+                userIds.insert(nativeProbeId);
+                nativeJoyWindow = window;
+                fprintf(stderr, "[JoyConProbe] connect begin id=%d\n", nativeProbeId);
+                window->onGamepadState(nativeProbeId, true);
+                fprintf(stderr, "[JoyConProbe] connect returned\n");
+            }
+            if (strcmp(nativeProbeMode, "connect") && strcmp(nativeProbeMode, "neutral")) {
+                GCExtendedGamepad* p = focusedWindow == window ? controller.extendedGamepad : nil;
+                const GamepadButtonId buttonIds[] = {GamepadButtonId::A, GamepadButtonId::B,
+                    GamepadButtonId::X, GamepadButtonId::Y, GamepadButtonId::LB, GamepadButtonId::RB,
+                    GamepadButtonId::BACK, GamepadButtonId::START, GamepadButtonId::GUIDE,
+                    GamepadButtonId::LEFT_STICK, GamepadButtonId::RIGHT_STICK,
+                    GamepadButtonId::DPAD_UP, GamepadButtonId::DPAD_RIGHT,
+                    GamepadButtonId::DPAD_DOWN, GamepadButtonId::DPAD_LEFT};
+                bool buttons[] = {p.buttonA.pressed, p.buttonB.pressed, p.buttonX.pressed, p.buttonY.pressed,
+                    p.leftShoulder.pressed, p.rightShoulder.pressed, p.buttonOptions.pressed, p.buttonMenu.pressed,
+                    p.buttonHome.pressed, p.leftThumbstickButton.pressed, p.rightThumbstickButton.pressed,
+                    p.dpad.up.pressed, p.dpad.right.pressed, p.dpad.down.pressed, p.dpad.left.pressed};
+                for (int i = 0; i < 15; ++i) {
+                    if (buttons[i] != nativeProbeButtons[i]) {
+                        window->onGamepadButton(nativeProbeId, buttonIds[i], buttons[i]);
+                        nativeProbeButtons[i] = buttons[i];
+                    }
+                }
+                auto axis = [](float v) {
+                    return std::fabs(v) < 0.15f ? 0.0f : std::copysign((std::fabs(v) - 0.15f) / 0.85f, v);
+                };
+                if (!strcmp(nativeProbeMode, "left") || !strcmp(nativeProbeMode, "right") || !strcmp(nativeProbeMode, "full")) {
+                    window->onGamepadAxis(nativeProbeId, GamepadAxisId::LEFT_X, axis(p.leftThumbstick.xAxis.value));
+                    window->onGamepadAxis(nativeProbeId, GamepadAxisId::LEFT_Y, -axis(p.leftThumbstick.yAxis.value));
+                }
+                if (!strcmp(nativeProbeMode, "right") || !strcmp(nativeProbeMode, "full")) {
+                    window->onGamepadAxis(nativeProbeId, GamepadAxisId::RIGHT_X, axis(p.rightThumbstick.xAxis.value));
+                    window->onGamepadAxis(nativeProbeId, GamepadAxisId::RIGHT_Y, -axis(p.rightThumbstick.yAxis.value));
+                }
+                if (!strcmp(nativeProbeMode, "full")) {
+                    window->onGamepadAxis(nativeProbeId, GamepadAxisId::LEFT_TRIGGER, p.leftTrigger.value);
+                    window->onGamepadAxis(nativeProbeId, GamepadAxisId::RIGHT_TRIGGER, p.rightTrigger.value);
+                }
+            }
+            if (!strcmp(nativeProbeMode, "neutral") && focusedWindow == window) {
+                if (!nativeProbeMotionLogged) fprintf(stderr, "[JoyConProbe] neutral motion begin\n");
+                window->onGamepadAxis(nativeProbeId, GamepadAxisId::LEFT_X, 0.0f);
+                if (!nativeProbeMotionLogged) fprintf(stderr, "[JoyConProbe] neutral motion returned\n");
+                nativeProbeMotionLogged = true;
+            }
+            return; // Probe modes never emit keyboard/mouse conversions.
+        }
         GCController* joy = nil;
         if (focusedWindow == window) {
             for (GCController* controller in GCController.controllers) {
