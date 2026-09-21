@@ -28,3 +28,8 @@ elseif (GAMEWINDOW_SYSTEM STREQUAL "SDL3")
     target_sources(gamewindow PRIVATE ${GAMEWINDOW_SOURCES_SDL3})
     target_link_libraries(gamewindow PRIVATE SDL3::SDL3)
 endif()
+
+if(APPLE AND GAMEWINDOW_SYSTEM STREQUAL "GLFW")
+    set_source_files_properties(src/joystick_manager_glfw.cpp PROPERTIES COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
+    target_link_libraries(gamewindow PUBLIC "-framework GameController")
+endif()
