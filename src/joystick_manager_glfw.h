@@ -23,6 +23,9 @@ private:
     static std::unordered_set<int> userIds;
 
     static int nextUnassignedUserId();
+#ifdef __APPLE__
+    static void updateNativeJoyCon(GLFWGameWindow* window);
+#endif
 
     static void _glfwJoystickCallback(int joystick, int action);
 

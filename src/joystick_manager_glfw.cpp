@@ -1,6 +1,20 @@
 #include "joystick_manager_glfw.h"
 
 #include <cstring>
+#ifdef __APPLE__
+#import <GameController/GameController.h>
+#include <cmath>
+#include <cstdio>
+static bool nativeJoyLogged = false;
+static bool nativeKeys[18]{};
+static double nativeMouseRemainderX = 0, nativeMouseRemainderY = 0;
+static bool nativeWasGameplay = false;
+static bool nativeMouse[2]{};
+static bool nativeShoulders[2]{};
+static auto nativeLastPoll = std::chrono::steady_clock::now();
+static GLFWGameWindow* nativeJoyWindow = nullptr;
+
+#endif
 #include <fstream>
 #include "window_glfw.h"
 #include "joystick_manager.h"
@@ -39,8 +53,11 @@ int GLFWJoystickManager::nextUnassignedUserId() {
 }
 
 void GLFWJoystickManager::update(GLFWGameWindow* window) {
-    if (focusedWindow != window)
-        return;
+    if (!window) return;
+#ifdef __APPLE__
+    updateNativeJoyCon(window);
+#endif
+    if (focusedWindow != window) return;
 
     for (auto& j : connectedJoysticks) {
         GLFWgamepadstate state;
@@ -87,6 +104,14 @@ void GLFWJoystickManager::addWindow(GLFWGameWindow* window) {
 }
 
 void GLFWJoystickManager::removeWindow(GLFWGameWindow* window) {
+#ifdef __APPLE__
+    if(nativeJoyWindow == window) {
+        nativeJoyWindow = nullptr;
+        memset(nativeKeys, 0, sizeof(nativeKeys));
+        memset(nativeMouse, 0, sizeof(nativeMouse));
+        memset(nativeShoulders, 0, sizeof(nativeShoulders));
+    }
+#endif
     windows.erase(window);
 }
 
@@ -174,3 +199,106 @@ GamepadAxisId GLFWJoystickManager::mapAxisId(int id) {
         default: return GamepadAxisId::UNKNOWN;
     }
 }
+#ifdef __APPLE__
+// Read native Joy-Con state, then use the existing keyboard/mouse callbacks.
+// Do not register an Android gamepad: that path crashes on world load here.
+void GLFWJoystickManager::updateNativeJoyCon(GLFWGameWindow* window) {
+    @autoreleasepool {
+        GCController* joy = nil;
+        if (focusedWindow == window) {
+            for (GCController* controller in GCController.controllers) {
+                if ([controller.productCategory containsString:@"Joy-Con (L/R)"] && controller.extendedGamepad) {
+                    joy = controller;
+                    break;
+                }
+            }
+        }
+        if (nativeJoyWindow && nativeJoyWindow != window) return;
+        if (!joy && !nativeJoyWindow) return;
+        nativeJoyWindow = window;
+        if (joy && !nativeJoyLogged) {
+            fprintf(stderr, "[NativeJoyCon] Keyboard/mouse v2 input enabled for Joy-Con (L/R)\n");
+            nativeJoyLogged = true;
+        }
+        auto now = std::chrono::steady_clock::now();
+        double dt = std::chrono::duration<double>(now - nativeLastPoll).count();
+        nativeLastPoll = now;
+        dt = std::min(0.05, std::max(0.0, dt));
+        GCExtendedGamepad* p = joy.extendedGamepad;
+        const bool gameplay = window->getCursorDisabled();
+        const int keys[] = {GLFW_KEY_W, GLFW_KEY_A, GLFW_KEY_S, GLFW_KEY_D,
+            GLFW_KEY_SPACE, GLFW_KEY_LEFT_SHIFT, GLFW_KEY_E, GLFW_KEY_Q,
+            GLFW_KEY_ESCAPE, GLFW_KEY_LEFT_CONTROL, GLFW_KEY_TAB,
+            GLFW_KEY_F5, GLFW_KEY_B, GLFW_KEY_T, GLFW_KEY_UP, GLFW_KEY_DOWN, GLFW_KEY_LEFT, GLFW_KEY_RIGHT};
+        bool pressed[] = {
+            gameplay && p.leftThumbstick.yAxis.value > 0.25f,
+            gameplay && p.leftThumbstick.xAxis.value < -0.25f,
+            gameplay && p.leftThumbstick.yAxis.value < -0.25f,
+            gameplay && p.leftThumbstick.xAxis.value > 0.25f,
+            gameplay && p.buttonA.pressed, gameplay && p.buttonB.pressed,
+            p.buttonX.pressed, gameplay && (p.buttonY.pressed || p.dpad.down.pressed),
+            p.buttonMenu.pressed || (!gameplay && p.buttonB.pressed),
+            gameplay && p.leftThumbstickButton.pressed, p.buttonOptions.pressed,
+            gameplay && p.dpad.up.pressed, gameplay && p.dpad.left.pressed, gameplay && p.dpad.right.pressed,
+            !gameplay && p.dpad.up.pressed, !gameplay && p.dpad.down.pressed,
+            !gameplay && p.dpad.left.pressed, !gameplay && p.dpad.right.pressed
+        };
+        for (int i = 0; i < 18; ++i) {
+            if (pressed[i] != nativeKeys[i]) {
+                GLFWGameWindow::_glfwKeyCallback(window->window, keys[i], 0,
+                    pressed[i] ? GLFW_PRESS : GLFW_RELEASE, 0);
+                nativeKeys[i] = pressed[i];
+            }
+        }
+        auto axis = [](float value) {
+            return std::fabs(value) < 0.15f ? 0.0f : std::copysign((std::fabs(value)-0.15f)/0.85f, value);
+        };
+        const double dx = axis(p.rightThumbstick.xAxis.value);
+        const double dy = -axis(p.rightThumbstick.yAxis.value);
+        if (!joy || gameplay != nativeWasGameplay) {
+            nativeMouseRemainderX = nativeMouseRemainderY = 0;
+        }
+        nativeWasGameplay = gameplay;
+        if (gameplay) {
+            // Minecraft's direct mouse API truncates to integer pixels. Preserve
+            // subpixel input across frames so camera speed is frame-rate independent.
+            nativeMouseRemainderX += dx * dt * 1300.0;
+            nativeMouseRemainderY += dy * dt * 1300.0;
+            const double moveX = std::trunc(nativeMouseRemainderX);
+            const double moveY = std::trunc(nativeMouseRemainderY);
+            nativeMouseRemainderX -= moveX;
+            nativeMouseRemainderY -= moveY;
+            if (moveX || moveY) window->onMouseRelativePosition(moveX, moveY);
+        } else if (joy) {
+            const double mx = dx + axis(p.leftThumbstick.xAxis.value);
+            const double my = dy - axis(p.leftThumbstick.yAxis.value);
+            if (mx || my) {
+                double x, y;
+                int width, height;
+                glfwGetCursorPos(window->window, &x, &y);
+                glfwGetWindowSize(window->window, &width, &height);
+                x = std::max(0.0, std::min(double(width-1), x + mx * dt * 650.0));
+                y = std::max(0.0, std::min(double(height-1), y + my * dt * 650.0));
+                glfwSetCursorPos(window->window, x, y);
+            }
+        }
+        bool mouse[] = {p.rightTrigger.value > 0.5f || (!gameplay && p.buttonA.pressed),
+                        p.leftTrigger.value > 0.5f};
+        for (int i = 0; i < 2; ++i) {
+            if (mouse[i] != nativeMouse[i]) {
+                GLFWGameWindow::_glfwMouseButtonCallback(window->window,
+                    i == 0 ? GLFW_MOUSE_BUTTON_LEFT : GLFW_MOUSE_BUTTON_RIGHT,
+                    mouse[i] ? GLFW_PRESS : GLFW_RELEASE, 0);
+                nativeMouse[i] = mouse[i];
+            }
+        }
+        bool shoulders[] = {p.leftShoulder.pressed, p.rightShoulder.pressed};
+        for (int i = 0; i < 2; ++i) {
+            if (shoulders[i] && !nativeShoulders[i])
+                GLFWGameWindow::_glfwScrollCallback(window->window, 0.0, i == 0 ? 1.0 : -1.0);
+            nativeShoulders[i] = shoulders[i];
+        }
+        if (!joy) nativeJoyWindow = nullptr;
+    }
+}
+#endif
